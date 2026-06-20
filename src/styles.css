@@ -144,7 +144,8 @@ button {
   background: #f0eadf;
 }
 
-.icon-button.is-active {
+.icon-button.is-active,
+.command-button.is-active {
   border-color: #1f6f60;
   color: #fff;
   background: #1f6f60;

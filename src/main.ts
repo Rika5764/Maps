@@ -1,12 +1,13 @@
 import "./styles.css";
 
-type RectItem = {
+type MapShape = {
   id: string;
   x: number;
   y: number;
   width: number;
   height: number;
   label: string;
+  points?: Point[];
 };
 
 type ProjectFile = {
@@ -15,7 +16,7 @@ type ProjectFile = {
     widthMeters: number;
     heightMeters: number;
   };
-  rects: RectItem[];
+  rects: MapShape[];
 };
 
 type StoredProject = {
@@ -31,15 +32,16 @@ type Viewport = {
 };
 
 type HistoryEntry =
-  | { kind: "create"; rect: RectItem }
-  | { kind: "delete"; rect: RectItem; index: number }
+  | { kind: "create"; shape: MapShape }
+  | { kind: "delete"; shape: MapShape; index: number }
+  | { kind: "replace"; before: MapShape; after: MapShape; index: number }
   | { kind: "label"; id: string; before: string; after: string };
 
 type DragState = {
   pointerId: number;
   startWorld: Point;
   lastWorld: Point;
-  currentRect: RectItem | null;
+  currentRect: MapShape | null;
   startedOnRectId: string | null;
   moved: boolean;
 };
@@ -93,13 +95,14 @@ app.innerHTML = `
       <div class="tool-row">
         <button id="undoButton" class="icon-button" type="button" aria-label="撤销" title="撤销">↶</button>
         <button id="deleteButton" class="icon-button" type="button" aria-label="删除工具" title="删除工具">⌫</button>
+        <button id="mergeButton" class="command-button" type="button" aria-label="合并绘制" title="合并绘制">合并</button>
         <button id="exportSvgButton" class="command-button" type="button">SVG</button>
         <button id="exportJsonButton" class="command-button" type="button">JSON</button>
         <button id="importJsonButton" class="command-button" type="button">导入</button>
       </div>
     </section>
 
-    <section id="labelEditor" class="label-editor" aria-label="Rectangle label editor" hidden>
+    <section id="labelEditor" class="label-editor" aria-label="Shape label editor" hidden>
       <input id="labelInput" type="text" autocomplete="off" placeholder="区域名称" />
       <button id="clearSelectionButton" class="compact-button" type="button">完成</button>
     </section>
@@ -123,6 +126,7 @@ const scaleReadout = mustElement<HTMLSpanElement>("#scaleReadout");
 const saveReadout = mustElement<HTMLSpanElement>("#saveReadout");
 const undoButton = mustElement<HTMLButtonElement>("#undoButton");
 const deleteButton = mustElement<HTMLButtonElement>("#deleteButton");
+const mergeButton = mustElement<HTMLButtonElement>("#mergeButton");
 const exportSvgButton = mustElement<HTMLButtonElement>("#exportSvgButton");
 const exportJsonButton = mustElement<HTMLButtonElement>("#exportJsonButton");
 const importJsonButton = mustElement<HTMLButtonElement>("#importJsonButton");
@@ -144,6 +148,7 @@ let project: ProjectFile = initialStoredProject.project;
 let viewport: Viewport = { scale: 12, offsetX: 0, offsetY: 0 };
 let selectedRectId: string | null = null;
 let deleteMode = false;
+let mergeMode = false;
 let dragState: DragState | null = null;
 let pinchState: PinchState | null = null;
 let activePointers = new Map<number, Point>();
@@ -192,7 +197,7 @@ function normalizeProject(value: unknown): ProjectFile {
   const rects = Array.isArray(candidate.rects)
     ? candidate.rects
         .map((rect, index) => normalizeRect(rect, index, map))
-        .filter((rect): rect is RectItem => rect !== null)
+        .filter((rect): rect is MapShape => rect !== null)
     : [];
 
   return {
@@ -202,12 +207,25 @@ function normalizeProject(value: unknown): ProjectFile {
   };
 }
 
-function normalizeRect(value: unknown, index: number, map: ProjectFile["map"]): RectItem | null {
+function normalizeRect(value: unknown, index: number, map: ProjectFile["map"]): MapShape | null {
   if (!value || typeof value !== "object") {
     return null;
   }
 
-  const rect = value as Partial<RectItem>;
+  const rect = value as Partial<MapShape>;
+  const points = normalizePoints(rect.points, map);
+
+  if (points) {
+    const bounds = getPointBounds(points);
+
+    return {
+      id: typeof rect.id === "string" && rect.id.length > 0 ? rect.id : `r${index + 1}`,
+      ...bounds,
+      label: typeof rect.label === "string" ? rect.label : "",
+      points,
+    };
+  }
+
   const x = Number(rect.x);
   const y = Number(rect.y);
   const width = Number(rect.width);
@@ -225,6 +243,37 @@ function normalizeRect(value: unknown, index: number, map: ProjectFile["map"]): 
     height: Math.round(height),
     label: typeof rect.label === "string" ? rect.label : "",
   }, map);
+}
+
+function normalizePoints(value: unknown, map: ProjectFile["map"]): Point[] | null {
+  if (!Array.isArray(value) || value.length < 3) {
+    return null;
+  }
+
+  const points = value
+    .map((point) => {
+      if (!point || typeof point !== "object") {
+        return null;
+      }
+
+      const candidate = point as Partial<Point>;
+      const x = Number(candidate.x);
+      const y = Number(candidate.y);
+
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return null;
+      }
+
+      return {
+        x: clamp(Math.round(x), 0, map.widthMeters),
+        y: clamp(Math.round(y), 0, map.heightMeters),
+      };
+    })
+    .filter((point): point is Point => point !== null);
+
+  const simplifiedPoints = points.length >= 3 ? simplifyPolygon(points) : [];
+
+  return simplifiedPoints.length >= 3 ? simplifiedPoints : null;
 }
 
 function makeStoredProject(nextProject: ProjectFile, savedAt = Date.now()): StoredProject {
@@ -435,28 +484,48 @@ function drawRects(): void {
   }
 }
 
-function drawRect(rect: RectItem, selected: boolean): void {
-  const topLeft = worldToScreen({ x: rect.x, y: rect.y });
-  const width = rect.width * viewport.scale;
-  const height = rect.height * viewport.scale;
-
+function drawRect(rect: MapShape, selected: boolean): void {
   ctx.save();
   ctx.fillStyle = selected ? "rgba(42, 110, 93, 0.18)" : "rgba(129, 89, 40, 0.16)";
   ctx.strokeStyle = selected ? "#1f6f60" : "#76542d";
   ctx.lineWidth = selected ? 3 : 2;
-  ctx.fillRect(topLeft.x, topLeft.y, width, height);
-  ctx.strokeRect(topLeft.x, topLeft.y, width, height);
+
+  if (rect.points?.length) {
+    drawPolygonPath(rect.points);
+    ctx.fill();
+    ctx.stroke();
+  } else {
+    const topLeft = worldToScreen({ x: rect.x, y: rect.y });
+    ctx.fillRect(topLeft.x, topLeft.y, rect.width * viewport.scale, rect.height * viewport.scale);
+    ctx.strokeRect(topLeft.x, topLeft.y, rect.width * viewport.scale, rect.height * viewport.scale);
+  }
 
   if (rect.label.trim()) {
     const fontSize = clamp(viewport.scale * 0.44, 11, 18);
+    const labelPoint = worldToScreen(getShapeLabelPoint(rect));
     ctx.fillStyle = "#2d2a24";
     ctx.font = `600 ${fontSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
     ctx.textBaseline = "middle";
     ctx.textAlign = "center";
-    drawWrappedText(rect.label, topLeft.x + width / 2, topLeft.y + height / 2, Math.max(10, width - 8), fontSize * 1.25);
+    drawWrappedText(rect.label, labelPoint.x, labelPoint.y, Math.max(10, rect.width * viewport.scale - 8), fontSize * 1.25);
   }
 
   ctx.restore();
+}
+
+function drawPolygonPath(points: Point[]): void {
+  const [firstPoint, ...restPoints] = points;
+  const firstScreenPoint = worldToScreen(firstPoint);
+
+  ctx.beginPath();
+  ctx.moveTo(firstScreenPoint.x, firstScreenPoint.y);
+
+  for (const point of restPoints) {
+    const screenPoint = worldToScreen(point);
+    ctx.lineTo(screenPoint.x, screenPoint.y);
+  }
+
+  ctx.closePath();
 }
 
 function drawWrappedText(text: string, centerX: number, centerY: number, maxWidth: number, lineHeight: number): void {
@@ -526,7 +595,7 @@ function pointerToCanvasPoint(event: PointerEvent): Point {
   };
 }
 
-function buildSnappedRect(start: Point, end: Point): RectItem | null {
+function buildSnappedRect(start: Point, end: Point): MapShape | null {
   const x1 = clamp(Math.round(start.x), 0, project.map.widthMeters);
   const y1 = clamp(Math.round(start.y), 0, project.map.heightMeters);
   const x2 = clamp(Math.round(end.x), 0, project.map.widthMeters);
@@ -550,16 +619,16 @@ function buildSnappedRect(start: Point, end: Point): RectItem | null {
   };
 }
 
-function hitTest(worldPoint: Point): RectItem | null {
+function hitTest(worldPoint: Point): MapShape | null {
   for (let index = project.rects.length - 1; index >= 0; index -= 1) {
     const rect = project.rects[index];
-
-    if (
+    const inBounds =
       worldPoint.x >= rect.x &&
       worldPoint.x <= rect.x + rect.width &&
       worldPoint.y >= rect.y &&
-      worldPoint.y <= rect.y + rect.height
-    ) {
+      worldPoint.y <= rect.y + rect.height;
+
+    if (inBounds && (!rect.points?.length || pointInPolygon(worldPoint, rect.points))) {
       return rect;
     }
   }
@@ -584,7 +653,7 @@ function setSelectedRect(id: string | null): void {
   draw();
 }
 
-function getSelectedRect(): RectItem | null {
+function getSelectedRect(): MapShape | null {
   if (!selectedRectId) {
     return null;
   }
@@ -618,6 +687,11 @@ function setDeleteMode(enabled: boolean): void {
   if (deleteMode) {
     setSelectedRect(null);
   }
+}
+
+function setMergeMode(enabled: boolean): void {
+  mergeMode = enabled;
+  mergeButton.classList.toggle("is-active", mergeMode);
 }
 
 canvas.addEventListener("pointerdown", (event) => {
@@ -720,10 +794,25 @@ function finishPointer(event: PointerEvent): void {
 
   if (dragState.currentRect) {
     const rect = dragState.currentRect;
-    project.rects.push(rect);
-    historyStack.push({ kind: "create", rect: structuredClone(rect) });
-    saveProject();
-    setSelectedRect(rect.id);
+    const mergeTarget = mergeMode ? findMergeTarget(rect) : null;
+
+    if (mergeTarget) {
+      const mergedShape = buildMergedShape(mergeTarget.shape, rect);
+      project.rects[mergeTarget.index] = mergedShape;
+      historyStack.push({
+        kind: "replace",
+        before: structuredClone(mergeTarget.shape),
+        after: structuredClone(mergedShape),
+        index: mergeTarget.index,
+      });
+      saveProject();
+      setSelectedRect(mergedShape.id);
+    } else {
+      project.rects.push(rect);
+      historyStack.push({ kind: "create", shape: structuredClone(rect) });
+      saveProject();
+      setSelectedRect(rect.id);
+    }
   } else if (!dragState.moved && hitRect) {
     if (deleteMode) {
       deleteRect(hitRect.id);
@@ -784,6 +873,116 @@ function updatePinch(): void {
   viewport.offsetY = center.y - pinchState.worldAtCenter.y * viewport.scale;
 }
 
+function findMergeTarget(newRect: MapShape): { shape: MapShape; index: number } | null {
+  for (let index = project.rects.length - 1; index >= 0; index -= 1) {
+    const shape = project.rects[index];
+
+    if (getShapeOverlapArea(shape, newRect) > 0) {
+      return { shape, index };
+    }
+  }
+
+  return null;
+}
+
+function buildMergedShape(baseShape: MapShape, newRect: MapShape): MapShape {
+  const points = buildShapeUnionPolygon(baseShape, newRect);
+  const bounds = getPointBounds(points);
+  const mergedShape: MapShape = {
+    id: baseShape.id,
+    ...bounds,
+    label: baseShape.label,
+  };
+
+  if (!isRectanglePolygon(points, bounds)) {
+    mergedShape.points = points;
+  }
+
+  return mergedShape;
+}
+
+function buildShapeUnionPolygon(first: MapShape, second: MapShape): Point[] {
+  const xs = uniqueSorted([...getShapeXCoordinates(first), ...getShapeXCoordinates(second)]);
+  const ys = uniqueSorted([...getShapeYCoordinates(first), ...getShapeYCoordinates(second)]);
+  const filledCells = new Set<string>();
+
+  for (let xIndex = 0; xIndex < xs.length - 1; xIndex += 1) {
+    for (let yIndex = 0; yIndex < ys.length - 1; yIndex += 1) {
+      const center = {
+        x: (xs[xIndex] + xs[xIndex + 1]) / 2,
+        y: (ys[yIndex] + ys[yIndex + 1]) / 2,
+      };
+
+      if (pointInShape(center, first) || pointInShape(center, second)) {
+        filledCells.add(cellKey(xIndex, yIndex));
+      }
+    }
+  }
+
+  const edges: Array<[Point, Point]> = [];
+
+  for (let xIndex = 0; xIndex < xs.length - 1; xIndex += 1) {
+    for (let yIndex = 0; yIndex < ys.length - 1; yIndex += 1) {
+      if (!filledCells.has(cellKey(xIndex, yIndex))) {
+        continue;
+      }
+
+      const x1 = xs[xIndex];
+      const x2 = xs[xIndex + 1];
+      const y1 = ys[yIndex];
+      const y2 = ys[yIndex + 1];
+
+      if (!filledCells.has(cellKey(xIndex, yIndex - 1))) edges.push([{ x: x1, y: y1 }, { x: x2, y: y1 }]);
+      if (!filledCells.has(cellKey(xIndex + 1, yIndex))) edges.push([{ x: x2, y: y1 }, { x: x2, y: y2 }]);
+      if (!filledCells.has(cellKey(xIndex, yIndex + 1))) edges.push([{ x: x2, y: y2 }, { x: x1, y: y2 }]);
+      if (!filledCells.has(cellKey(xIndex - 1, yIndex))) edges.push([{ x: x1, y: y2 }, { x: x1, y: y1 }]);
+    }
+  }
+
+  return simplifyPolygon(traceBoundary(edges));
+}
+
+function traceBoundary(edges: Array<[Point, Point]>): Point[] {
+  const adjacency = new Map<string, string[]>();
+
+  for (const [start, end] of edges) {
+    const startKey = pointKey(start);
+    const endKey = pointKey(end);
+    adjacency.set(startKey, [...(adjacency.get(startKey) ?? []), endKey]);
+    adjacency.set(endKey, [...(adjacency.get(endKey) ?? []), startKey]);
+  }
+
+  const startKey = Array.from(adjacency.keys()).sort(comparePointKeys)[0];
+  const firstNeighbor = (adjacency.get(startKey) ?? []).sort(comparePointKeys)[0];
+
+  if (!startKey || !firstNeighbor) {
+    return [];
+  }
+
+  const polygonKeys = [startKey];
+  let previousKey = startKey;
+  let currentKey = firstNeighbor;
+
+  for (let guard = 0; guard < edges.length + 4; guard += 1) {
+    if (currentKey === startKey) {
+      break;
+    }
+
+    polygonKeys.push(currentKey);
+    const neighbors = adjacency.get(currentKey) ?? [];
+    const nextKey = neighbors.find((neighbor) => neighbor !== previousKey);
+
+    if (!nextKey) {
+      break;
+    }
+
+    previousKey = currentKey;
+    currentKey = nextKey;
+  }
+
+  return polygonKeys.map(parsePointKey);
+}
+
 function deleteRect(id: string): void {
   const index = project.rects.findIndex((rect) => rect.id === id);
 
@@ -792,7 +991,7 @@ function deleteRect(id: string): void {
   }
 
   const [rect] = project.rects.splice(index, 1);
-  historyStack.push({ kind: "delete", rect: structuredClone(rect), index });
+  historyStack.push({ kind: "delete", shape: structuredClone(rect), index });
 
   if (selectedRectId === id) {
     setSelectedRect(null);
@@ -810,14 +1009,21 @@ function undo(): void {
   }
 
   if (entry.kind === "create") {
-    project.rects = project.rects.filter((rect) => rect.id !== entry.rect.id);
-    if (selectedRectId === entry.rect.id) {
+    project.rects = project.rects.filter((rect) => rect.id !== entry.shape.id);
+    if (selectedRectId === entry.shape.id) {
       setSelectedRect(null);
     }
   }
 
   if (entry.kind === "delete") {
-    project.rects.splice(entry.index, 0, structuredClone(entry.rect));
+    project.rects.splice(entry.index, 0, structuredClone(entry.shape));
+  }
+
+  if (entry.kind === "replace") {
+    project.rects[entry.index] = structuredClone(entry.before);
+    if (selectedRectId === entry.after.id) {
+      setSelectedRect(entry.before.id);
+    }
   }
 
   if (entry.kind === "label") {
@@ -831,11 +1037,25 @@ function undo(): void {
   draw();
 }
 
-function clampRectToMap(rect: RectItem): RectItem {
+function clampRectToMap(rect: MapShape): MapShape {
   return clampRectToMapSize(rect, project.map);
 }
 
-function clampRectToMapSize(rect: RectItem, map: ProjectFile["map"]): RectItem {
+function clampRectToMapSize(rect: MapShape, map: ProjectFile["map"]): MapShape {
+  if (rect.points?.length) {
+    const points = rect.points.map((point) => ({
+      x: clamp(Math.round(point.x), 0, map.widthMeters),
+      y: clamp(Math.round(point.y), 0, map.heightMeters),
+    }));
+    const bounds = getPointBounds(points);
+
+    return {
+      ...rect,
+      ...bounds,
+      points,
+    };
+  }
+
   const x = clamp(Math.round(rect.x), 0, map.widthMeters - 1);
   const y = clamp(Math.round(rect.y), 0, map.heightMeters - 1);
   const maxWidth = map.widthMeters - x;
@@ -876,11 +1096,15 @@ function buildSvg(): string {
   const rects = project.rects
     .map((rect) => {
       const label = escapeXml(rect.label);
+      const labelPoint = getShapeLabelPoint(rect);
       const text = label
-        ? `<text x="${rect.x + rect.width / 2}" y="${rect.y + rect.height / 2}" font-size="0.55" font-family="system-ui, sans-serif" font-weight="600" text-anchor="middle" dominant-baseline="middle" fill="#2d2a24">${label}</text>`
+        ? `<text x="${labelPoint.x}" y="${labelPoint.y}" font-size="0.55" font-family="system-ui, sans-serif" font-weight="600" text-anchor="middle" dominant-baseline="middle" fill="#2d2a24">${label}</text>`
         : "";
+      const shape = rect.points?.length
+        ? `<polygon points="${rect.points.map((point) => `${point.x},${point.y}`).join(" ")}" fill="rgba(129,89,40,0.16)" stroke="#76542d" stroke-width="0.08" />`
+        : `<rect x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" fill="rgba(129,89,40,0.16)" stroke="#76542d" stroke-width="0.08" />`;
 
-      return `<g><rect x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" fill="rgba(129,89,40,0.16)" stroke="#76542d" stroke-width="0.08" />${text}</g>`;
+      return `<g>${shape}${text}</g>`;
     })
     .join("\n  ");
 
@@ -938,6 +1162,210 @@ function distance(first: Point, second: Point): number {
   return Math.hypot(first.x - second.x, first.y - second.y);
 }
 
+function getShapeOverlapArea(first: MapShape, second: MapShape): number {
+  const xs = uniqueSorted([...getShapeXCoordinates(first), ...getShapeXCoordinates(second)]);
+  const ys = uniqueSorted([...getShapeYCoordinates(first), ...getShapeYCoordinates(second)]);
+  let area = 0;
+
+  for (let xIndex = 0; xIndex < xs.length - 1; xIndex += 1) {
+    for (let yIndex = 0; yIndex < ys.length - 1; yIndex += 1) {
+      const width = xs[xIndex + 1] - xs[xIndex];
+      const height = ys[yIndex + 1] - ys[yIndex];
+
+      if (width <= 0 || height <= 0) {
+        continue;
+      }
+
+      const center = {
+        x: xs[xIndex] + width / 2,
+        y: ys[yIndex] + height / 2,
+      };
+
+      if (pointInShape(center, first) && pointInShape(center, second)) {
+        area += width * height;
+      }
+    }
+  }
+
+  return area;
+}
+
+function pointInRect(point: Point, rect: MapShape): boolean {
+  return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+}
+
+function pointInShape(point: Point, shape: MapShape): boolean {
+  return shape.points?.length ? pointInPolygon(point, shape.points) : pointInRect(point, shape);
+}
+
+function getShapeXCoordinates(shape: MapShape): number[] {
+  if (shape.points?.length) {
+    return shape.points.map((point) => point.x);
+  }
+
+  return [shape.x, shape.x + shape.width];
+}
+
+function getShapeYCoordinates(shape: MapShape): number[] {
+  if (shape.points?.length) {
+    return shape.points.map((point) => point.y);
+  }
+
+  return [shape.y, shape.y + shape.height];
+}
+
+function pointInPolygon(point: Point, points: Point[]): boolean {
+  if (isPointOnPolygonBoundary(point, points)) {
+    return true;
+  }
+
+  let inside = false;
+
+  for (let currentIndex = 0, previousIndex = points.length - 1; currentIndex < points.length; previousIndex = currentIndex++) {
+    const currentPoint = points[currentIndex];
+    const previousPoint = points[previousIndex];
+    const intersects =
+      currentPoint.y > point.y !== previousPoint.y > point.y &&
+      point.x <
+        ((previousPoint.x - currentPoint.x) * (point.y - currentPoint.y)) / (previousPoint.y - currentPoint.y) +
+          currentPoint.x;
+
+    if (intersects) {
+      inside = !inside;
+    }
+  }
+
+  return inside;
+}
+
+function isPointOnPolygonBoundary(point: Point, points: Point[]): boolean {
+  return points.some((start, index) => {
+    const end = points[(index + 1) % points.length];
+    const cross = (point.x - start.x) * (end.y - start.y) - (point.y - start.y) * (end.x - start.x);
+
+    if (Math.abs(cross) > 0.0001) {
+      return false;
+    }
+
+    return (
+      point.x >= Math.min(start.x, end.x) &&
+      point.x <= Math.max(start.x, end.x) &&
+      point.y >= Math.min(start.y, end.y) &&
+      point.y <= Math.max(start.y, end.y)
+    );
+  });
+}
+
+function getShapeLabelPoint(shape: MapShape): Point {
+  if (shape.points?.length) {
+    return getPolygonCentroid(shape.points);
+  }
+
+  return {
+    x: shape.x + shape.width / 2,
+    y: shape.y + shape.height / 2,
+  };
+}
+
+function getPolygonCentroid(points: Point[]): Point {
+  let area = 0;
+  let x = 0;
+  let y = 0;
+
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    const cross = current.x * next.y - next.x * current.y;
+    area += cross;
+    x += (current.x + next.x) * cross;
+    y += (current.y + next.y) * cross;
+  }
+
+  if (area === 0) {
+    const bounds = getPointBounds(points);
+    return {
+      x: bounds.x + bounds.width / 2,
+      y: bounds.y + bounds.height / 2,
+    };
+  }
+
+  return {
+    x: x / (3 * area),
+    y: y / (3 * area),
+  };
+}
+
+function getPointBounds(points: Point[]): Pick<MapShape, "x" | "y" | "width" | "height"> {
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const minY = Math.min(...ys);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...ys);
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function simplifyPolygon(points: Point[]): Point[] {
+  const withoutDuplicateClosingPoint =
+    points.length > 1 && pointKey(points[0]) === pointKey(points[points.length - 1]) ? points.slice(0, -1) : points;
+
+  return withoutDuplicateClosingPoint.filter((point, index, polygon) => {
+    const previous = polygon[(index - 1 + polygon.length) % polygon.length];
+    const next = polygon[(index + 1) % polygon.length];
+    return !isCollinear(previous, point, next);
+  });
+}
+
+function isCollinear(first: Point, second: Point, third: Point): boolean {
+  return (first.x === second.x && second.x === third.x) || (first.y === second.y && second.y === third.y);
+}
+
+function isRectanglePolygon(points: Point[], bounds: Pick<MapShape, "x" | "y" | "width" | "height">): boolean {
+  if (points.length !== 4) {
+    return false;
+  }
+
+  const cornerKeys = new Set([
+    pointKey({ x: bounds.x, y: bounds.y }),
+    pointKey({ x: bounds.x + bounds.width, y: bounds.y }),
+    pointKey({ x: bounds.x + bounds.width, y: bounds.y + bounds.height }),
+    pointKey({ x: bounds.x, y: bounds.y + bounds.height }),
+  ]);
+
+  return points.every((point) => cornerKeys.has(pointKey(point)));
+}
+
+function uniqueSorted(values: number[]): number[] {
+  return Array.from(new Set(values)).sort((first, second) => first - second);
+}
+
+function cellKey(xIndex: number, yIndex: number): string {
+  return `${xIndex},${yIndex}`;
+}
+
+function pointKey(point: Point): string {
+  return `${point.x},${point.y}`;
+}
+
+function parsePointKey(key: string): Point {
+  const [x, y] = key.split(",").map(Number);
+
+  return { x, y };
+}
+
+function comparePointKeys(firstKey: string, secondKey: string): number {
+  const first = parsePointKey(firstKey);
+  const second = parsePointKey(secondKey);
+
+  return first.y - second.y || first.x - second.x;
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -953,6 +1381,7 @@ function escapeXml(value: string): string {
 
 undoButton.addEventListener("click", undo);
 deleteButton.addEventListener("click", () => setDeleteMode(!deleteMode));
+mergeButton.addEventListener("click", () => setMergeMode(!mergeMode));
 exportJsonButton.addEventListener("click", exportJson);
 exportSvgButton.addEventListener("click", exportSvg);
 importJsonButton.addEventListener("click", () => fileInput.click());
