@@ -96,6 +96,7 @@ app.innerHTML = `
         <button id="undoButton" class="icon-button" type="button" aria-label="撤销" title="撤销">↶</button>
         <button id="deleteButton" class="icon-button" type="button" aria-label="删除工具" title="删除工具">⌫</button>
         <button id="mergeButton" class="command-button" type="button" aria-label="合并绘制" title="合并绘制">合并</button>
+        <button id="copyButton" class="command-button" type="button" aria-label="复制工具" title="复制工具">复制</button>
         <button id="exportSvgButton" class="command-button" type="button">SVG</button>
         <button id="exportJsonButton" class="command-button" type="button">JSON</button>
         <button id="importJsonButton" class="command-button" type="button">导入</button>
@@ -127,6 +128,7 @@ const saveReadout = mustElement<HTMLSpanElement>("#saveReadout");
 const undoButton = mustElement<HTMLButtonElement>("#undoButton");
 const deleteButton = mustElement<HTMLButtonElement>("#deleteButton");
 const mergeButton = mustElement<HTMLButtonElement>("#mergeButton");
+const copyButton = mustElement<HTMLButtonElement>("#copyButton");
 const exportSvgButton = mustElement<HTMLButtonElement>("#exportSvgButton");
 const exportJsonButton = mustElement<HTMLButtonElement>("#exportJsonButton");
 const importJsonButton = mustElement<HTMLButtonElement>("#importJsonButton");
@@ -149,6 +151,7 @@ let viewport: Viewport = { scale: 12, offsetX: 0, offsetY: 0 };
 let selectedRectId: string | null = null;
 let deleteMode = false;
 let mergeMode = false;
+let copyMode = false;
 let dragState: DragState | null = null;
 let pinchState: PinchState | null = null;
 let activePointers = new Map<number, Point>();
@@ -560,15 +563,23 @@ function drawDraftRect(): void {
   }
 
   const rect = dragState.currentRect;
-  const topLeft = worldToScreen({ x: rect.x, y: rect.y });
 
   ctx.save();
   ctx.fillStyle = "rgba(48, 102, 190, 0.14)";
   ctx.strokeStyle = "#2f64b1";
   ctx.lineWidth = 2;
   ctx.setLineDash([6, 4]);
-  ctx.fillRect(topLeft.x, topLeft.y, rect.width * viewport.scale, rect.height * viewport.scale);
-  ctx.strokeRect(topLeft.x, topLeft.y, rect.width * viewport.scale, rect.height * viewport.scale);
+
+  if (rect.points?.length) {
+    drawPolygonPath(rect.points);
+    ctx.fill();
+    ctx.stroke();
+  } else {
+    const topLeft = worldToScreen({ x: rect.x, y: rect.y });
+    ctx.fillRect(topLeft.x, topLeft.y, rect.width * viewport.scale, rect.height * viewport.scale);
+    ctx.strokeRect(topLeft.x, topLeft.y, rect.width * viewport.scale, rect.height * viewport.scale);
+  }
+
   ctx.restore();
 }
 
@@ -617,6 +628,34 @@ function buildSnappedRect(start: Point, end: Point): MapShape | null {
     height,
     label: "",
   };
+}
+
+function buildCopiedShape(sourceShape: MapShape, start: Point, end: Point): MapShape | null {
+  const rawDeltaX = Math.round(end.x - start.x);
+  const rawDeltaY = Math.round(end.y - start.y);
+  const deltaX = clamp(rawDeltaX, -sourceShape.x, project.map.widthMeters - (sourceShape.x + sourceShape.width));
+  const deltaY = clamp(rawDeltaY, -sourceShape.y, project.map.heightMeters - (sourceShape.y + sourceShape.height));
+
+  if (deltaX === 0 && deltaY === 0) {
+    return null;
+  }
+
+  const copiedShape: MapShape = {
+    ...structuredClone(sourceShape),
+    id: makeId(),
+    x: sourceShape.x + deltaX,
+    y: sourceShape.y + deltaY,
+    label: sourceShape.label,
+  };
+
+  if (sourceShape.points?.length) {
+    copiedShape.points = sourceShape.points.map((point) => ({
+      x: point.x + deltaX,
+      y: point.y + deltaY,
+    }));
+  }
+
+  return copiedShape;
 }
 
 function hitTest(worldPoint: Point): MapShape | null {
@@ -685,6 +724,7 @@ function setDeleteMode(enabled: boolean): void {
   deleteButton.classList.toggle("is-active", deleteMode);
 
   if (deleteMode) {
+    setCopyMode(false);
     setSelectedRect(null);
   }
 }
@@ -692,6 +732,15 @@ function setDeleteMode(enabled: boolean): void {
 function setMergeMode(enabled: boolean): void {
   mergeMode = enabled;
   mergeButton.classList.toggle("is-active", mergeMode);
+}
+
+function setCopyMode(enabled: boolean): void {
+  copyMode = enabled;
+  copyButton.classList.toggle("is-active", copyMode);
+
+  if (copyMode) {
+    setDeleteMode(false);
+  }
 }
 
 canvas.addEventListener("pointerdown", (event) => {
@@ -757,7 +806,10 @@ canvas.addEventListener("pointermove", (event) => {
   dragState.lastWorld = worldPoint;
   dragState.moved = dragState.moved || movedPixels > TAP_MOVE_THRESHOLD;
 
-  if (dragState.moved && !dragState.startedOnRectId && !deleteMode) {
+  if (dragState.moved && copyMode && dragState.startedOnRectId && !deleteMode) {
+    const sourceShape = project.rects.find((rect) => rect.id === dragState?.startedOnRectId);
+    dragState.currentRect = sourceShape ? buildCopiedShape(sourceShape, dragState.startWorld, worldPoint) : null;
+  } else if (dragState.moved && !copyMode && !dragState.startedOnRectId && !deleteMode) {
     dragState.currentRect = buildSnappedRect(dragState.startWorld, worldPoint);
   }
 
@@ -794,7 +846,8 @@ function finishPointer(event: PointerEvent): void {
 
   if (dragState.currentRect) {
     const rect = dragState.currentRect;
-    const mergeTarget = mergeMode ? findMergeTarget(rect) : null;
+    const isCopy = copyMode && Boolean(dragState.startedOnRectId);
+    const mergeTarget = !isCopy && mergeMode ? findMergeTarget(rect) : null;
 
     if (mergeTarget) {
       const mergedShape = buildMergedShape(mergeTarget.shape, rect);
@@ -1382,6 +1435,7 @@ function escapeXml(value: string): string {
 undoButton.addEventListener("click", undo);
 deleteButton.addEventListener("click", () => setDeleteMode(!deleteMode));
 mergeButton.addEventListener("click", () => setMergeMode(!mergeMode));
+copyButton.addEventListener("click", () => setCopyMode(!copyMode));
 exportJsonButton.addEventListener("click", exportJson);
 exportSvgButton.addEventListener("click", exportSvg);
 importJsonButton.addEventListener("click", () => fileInput.click());
